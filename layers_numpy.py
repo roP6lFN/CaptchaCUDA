@@ -68,7 +68,8 @@ class Conv2D(object):
         self.w_gradient = np.zeros(self.weights.shape)
         self.b_gradient = np.zeros(self.bias.shape)
         self.output_shape = self.eta.shape
-
+    
+    '''
     def forward(self, x):
         x = np.pad(x, (
             (0, 0), (self.ksize // 2, self.ksize // 2), (self.ksize // 2, self.ksize // 2), (0, 0)),
@@ -91,6 +92,23 @@ class Conv2D(object):
         for i in range(self.batchsize):
             col_conv_out = np.dot(self.col_image[i], col_weights) + self.bias
             conv_out[i] = np.reshape(col_conv_out, self.eta[0].shape)
+        return conv_out
+    '''
+    
+    def forward(self, x):
+        col_weights = self.weights.reshape([-1, self.output_channels])
+        x = np.pad(x, (
+            (0, 0), (self.ksize // 2, self.ksize // 2), (self.ksize // 2, self.ksize // 2), (0, 0)),
+            'constant', constant_values=0)
+        self.col_image = []  # also use in BP
+        conv_out = np.zeros(self.eta.shape)
+        for i in range(self.batchsize):
+            img_i = x[i][np.newaxis, :]
+            col_image_i = im2col(img_i, self.ksize, self.stride) # Kaiming He's image to column algorithm
+            conv_out[i] = np.reshape(
+                np.dot(col_image_i, col_weights) + self.bias, self.eta[0].shape)
+            self.col_image.append(col_image_i)
+        self.col_image = np.array(self.col_image)
         return conv_out
 
     def forward_gpu(self, x):
@@ -188,42 +206,27 @@ class MaxPooling(object):
     def forward_gpu(self, x):
         out = np.zeros([x.shape[0], x.shape[1] // self.stride,
                        x.shape[2] // self.stride, self.input_channels])
-        #grid = (out.shape[3])
-        #block = (out.shape[1], out.shape[2])
-        #pool[grid, block](x, out, self.index)
         grid = (out.shape[0], out.shape[3])
         block = (out.shape[1], out.shape[2])
-        pool2[grid, block](x, out, self.index)
+        pool[grid, block](x, out, self.index)
         cuda.synchronize()
         return out
 
     def gradient(self, eta):
-        return np.repeat(np.repeat(eta, self.stride, axis=1), self.stride, axis=2) * self.index
+        tmp = np.repeat(eta, self.stride, axis=1)
+        tmp = np.repeat(tmp, self.stride, axis=2)
+        return tmp * self.index
+
+    def gradient_gpu(self, eta):
+        ret = np.zeros(self.index.shape)
+        grid = (eta.shape[0], eta.shape[3])
+        block = (eta.shape[1], eta.shape[2])
+        pool_bp[grid, block](eta, ret, self.index)
+        return ret
 
 
 @cuda.jit()
 def pool(inputs, outputs, mask):
-    tx = cuda.threadIdx.x
-    ty = cuda.threadIdx.y
-    d = cuda.blockIdx.x
-    idx = 0
-
-    for i in range(inputs.shape[0]):
-        outputs[i, tx, ty, d] = max(inputs[i, 2*tx, 2*ty, d], inputs[i, 2*tx, 2*ty+1, d],
-                                    inputs[i, 2*tx+1, 2*ty, d], inputs[i, 2*tx+1, 2*ty+1, d])
-        if outputs[i, tx, ty, d] == inputs[i, 2*tx, 2*ty, d]:
-            idx = 0
-        elif outputs[i, tx, ty, d] == inputs[i, 2*tx, 2*ty+1, d]:
-            idx = 1
-        elif outputs[i, tx, ty, d] == inputs[i, 2*tx+1, 2*ty, d]:
-            idx = 2
-        else:
-            idx = 3
-        mask[i, tx*2+idx//2, ty*2+idx % 2, d] = 1
-
-
-@cuda.jit()
-def pool2(inputs, outputs, mask):
     tx = cuda.threadIdx.x
     ty = cuda.threadIdx.y
     image = cuda.blockIdx.x
@@ -243,6 +246,17 @@ def pool2(inputs, outputs, mask):
         idx = 3
     mask[image, tx*2+idx//2, ty*2+idx % 2, channel] = 1
 
+
+@cuda.jit()
+def pool_bp(inputs, outputs, mask):
+    tx = cuda.threadIdx.x
+    ty = cuda.threadIdx.y
+    image = cuda.blockIdx.x
+    channel = cuda.blockIdx.y
+    outputs[image, 2*tx, 2*ty, channel] = inputs[image, tx, ty, channel] *mask[image, 2*tx, 2*ty, channel]
+    outputs[image, 2*tx, 2*ty+1, channel] = inputs[image, tx, ty, channel] * mask[image, 2*tx, 2*ty+1, channel]
+    outputs[image, 2*tx+1, 2*ty, channel] = inputs[image, tx, ty, channel] * mask[image, 2*tx+1, 2*ty, channel]
+    outputs[image, 2*tx+1, 2*ty+1, channel] = inputs[image, tx, ty, channel] * mask[image, 2*tx+1, 2*ty+1, channel]
 
 class FullyConnect(object):
     def __init__(self, shape, output_num=216):
